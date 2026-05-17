@@ -108,11 +108,16 @@ ENSEMBLE_MODELS = [
     os.environ.get("ENSEMBLE_MODEL_4", "google/gemini-2.5-flash:online"),
 ]
 
-# Active-mode direct-provider supplements. These call Anthropic and OpenAI
-# directly (independent infrastructure from OpenRouter) WITHOUT web search,
-# acting as calibration anchors against search-grounded confidently-wrong
-# calls. Weight 0.4 means each direct sample counts ~40% of a search sample.
-USE_DIRECT_PROVIDERS = os.environ.get("USE_DIRECT_PROVIDERS", "1") == "1"
+# Active-mode direct-provider supplements (Anthropic + OpenAI, no search).
+# Tested empirically and disabled by default: production backtest with these
+# active showed Brier 0.0786 -> 0.1078 because the no-search providers don't
+# know recent events (SCOTUS votes, election outcomes, Survivor episodes)
+# and contribute mediocre guesses that dilute search-grounded correct answers.
+# Direct keys still serve as FALLBACK (chain runs when ALL OpenRouter calls
+# fail) — that role is preserved via the get_anthropic_client / get_openai_*
+# helpers and the legacy fallback path. To re-enable for experimentation:
+# set USE_DIRECT_PROVIDERS=1 on Render.
+USE_DIRECT_PROVIDERS = os.environ.get("USE_DIRECT_PROVIDERS", "0") == "1"
 DIRECT_PROVIDER_WEIGHT = float(os.environ.get("DIRECT_PROVIDER_WEIGHT", "0.4"))
 
 # OpenRouter :online plugin config — request more search results (default ~3)
@@ -589,7 +594,29 @@ def forecast(event: Event) -> Prediction:
                 failures.append(f"{name}: {rat_or_err}")
 
     if not samples_weighted:
-        logger.warning("All providers failed for %s: %s", event.market_ticker, failures[:5])
+        # Everything in the active ensemble failed. Walk the fallback chain:
+        # Anthropic direct -> OpenAI direct -> uniform. (These are still
+        # useful as last-resort when OpenRouter is fully down; they were
+        # only disabled in the *active* path because they hurt expected value.)
+        logger.warning("All active ensemble failed for %s: %s", event.market_ticker, failures[:5])
+        a_client = get_anthropic_client()
+        if a_client is not None:
+            probs_fb, rat_fb = _call_anthropic_active(event)
+            if probs_fb is not None:
+                return Prediction(
+                    probabilities=probs_fb,
+                    rationale=(f"Anthropic-direct fallback: {rat_fb}")[:500],
+                    p_yes=_compute_p_yes(probs_fb),
+                )
+        o_client = get_openai_fallback_client()
+        if o_client is not None:
+            probs_oai, rat_oai = _call_openai_direct_active(event)
+            if probs_oai is not None:
+                return Prediction(
+                    probabilities=probs_oai,
+                    rationale=(f"OpenAI-direct fallback: {rat_oai}")[:500],
+                    p_yes=_compute_p_yes(probs_oai),
+                )
         return _uniform_fallback(event.outcomes, f"all providers failed: {failures[:3]}")
 
     # Weighted mean per outcome
