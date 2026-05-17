@@ -76,6 +76,22 @@ Set in `.env`:
 The free tier on [Render](https://render.com) works out of the box.
 Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 
+## AI tools disclosure
+
+Per the Prophet Hacks 2026 rules (Section 7: "AI tools (coding assistants,
+LLM agents, etc.) are allowed and encouraged for building"), this project
+was built solo by [@chanjoongx](https://github.com/chanjoongx) using
+[Claude Code](https://claude.com/claude-code) as a coding assistant during
+the 32-hour build window. All architectural decisions, prompt engineering,
+calibration choices, and the local Brier evaluation methodology are the
+author's; Claude Code was used for code scaffolding, refactoring, and
+debugging — the same way one would use an autocomplete or pair-programming
+tool.
+
+The project's runtime LLM (the model that actually produces forecasts) is
+configurable via `.env`; defaults to `anthropic/claude-sonnet-4:online` via
+OpenRouter.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
