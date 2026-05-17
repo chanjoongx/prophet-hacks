@@ -31,7 +31,12 @@ load_dotenv()
 logger = logging.getLogger("agent")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-app = FastAPI(title="chanjoongx - Prophet Hacks Forecasting Agent")
+app = FastAPI(
+    title="chanjoongx - Prophet Hacks Forecasting Agent",
+    docs_url=None,        # disable /docs Swagger UI (hide schema from competitors)
+    redoc_url=None,       # disable /redoc
+    openapi_url=None,     # disable /openapi.json
+)
 
 
 class Event(BaseModel):
@@ -345,7 +350,7 @@ def predict(event: dict) -> dict:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"status": "ok", "agent": "chanjoongx", "model": DEFAULT_MODEL}
+    return {"status": "ok", "agent": "chanjoongx"}
 
 
 @app.get("/health")
