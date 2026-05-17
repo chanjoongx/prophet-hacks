@@ -336,9 +336,19 @@ def _coerce_probabilities(raw: Any, outcomes: list[str]) -> list[MarketProbabili
         else:
             unmatched_outcomes.append(outcome)
 
+    # Hybrid residual: max of (true residual mass) and (half-uniform floor).
+    # The half-uniform floor (0.5/N) keeps some humility for outcomes the LLM
+    # didn't mention, dampening confident-wrong amplification. Pure residual
+    # would let confident-wrong calls dominate (LLM picks wrong outcome at 0.85
+    # -> Brier 1.69; with floor -> Brier 1.36 after server normalization).
     total_matched = sum(matched.values())
     n_unmatched = len(unmatched_outcomes)
-    residual_each = (max(0.0, 1.0 - total_matched) / n_unmatched) if n_unmatched > 0 else 0.0
+    if n_unmatched > 0:
+        true_residual = max(0.0, 1.0 - total_matched) / n_unmatched
+        humility_floor = 0.5 / n  # half the old 1/N uniform fallback
+        residual_each = max(true_residual, humility_floor)
+    else:
+        residual_each = 0.0
 
     result: list[MarketProbability] = []
     for outcome in outcomes:
