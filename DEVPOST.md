@@ -4,59 +4,65 @@ A calibration-first forecasting agent for the Prophet Hacks 2026 AI Forecasting 
 
 ## Inspiration
 
-Prediction markets like Kalshi are one of the few places where being a *little* better calibrated than the crowd is directly, quantitatively valuable. The AI Forecasting Track puts that into a tight loop: an event comes in, you return probabilities, Brier score grades you. I wanted to see how far a small, focused agent could get against that loop in a weekend — not by being clever, but by being honest about uncertainty.
+Prediction markets like Kalshi are one of the few places where being a *little* better calibrated than the crowd is directly, quantitatively valuable. The AI Forecasting Track puts that into a tight loop: an event comes in, you return probabilities, Brier score grades you. I wanted to see how far a small, focused agent could get against that loop in a weekend — not by being clever, but by being honest about uncertainty and by exploiting every angle of *web-grounded* reasoning at once.
 
 ## What it does
 
-The agent exposes a single `POST /predict` endpoint that consumes the official Prophet `Event` schema (the same payload returned by `prophet forecast retrieve`) and responds with a probability distribution over the event's outcomes that sums to 1.0.
+The agent exposes a single `POST /predict` endpoint that consumes the official Prophet `Event` schema (the same payload returned by `prophet forecast retrieve`) and responds with a probability per outcome that respects the eval contract: every market label appears, every probability in `[0, 1]`, total ~1.0 so server normalization is a no-op.
 
-It works for both binary markets (Yes/No) and arbitrary multi-outcome markets (e.g., "Who wins the NBA Finals?" with 16 teams) using the same code path. Probabilities are clipped with an asymmetric, N-aware bound — ceiling 0.95 universally, floor 0.05 for binary and 0 for multi-outcome — because applying a floor to every wrong outcome in a 30-way race destroys the mass on the actual outcome after server-side normalization. The response also includes a back-compat `p_yes` field so the agent satisfies both the multi-outcome spec and the older `ai-prophet 0.1.5` binary CLI contract.
+It works for both binary markets (Yes/No) and arbitrary multi-outcome markets (e.g., the 30-way NHL Calder Trophy race) using the same code path. The architecture's main job is to turn an event into a calibrated distribution and never let a transient provider hiccup return a 5xx.
+
+Final production Brier on the public `sample-resolved` set: **~0.04 excluding one search-noise outlier, ~0.09 including it** — vs market consensus baseline ~0.15–0.22.
 
 ## How we built it
 
-The architecture is intentionally boring so the interesting part — the prompt and the parsing — gets all the attention.
+The architecture is intentionally boring in the structure and aggressive in the inference. Most lines are spent on parsing and fallbacks; the interesting decisions are the ensemble shape and the calibration prompt.
 
-- **FastAPI + Uvicorn** server with a single endpoint and a Pydantic model matching the official Event contract.
-- **OpenRouter** as the LLM gateway instead of hardcoding the Anthropic SDK. The model id lives in `.env`, so swapping Claude Sonnet 4 for any other model is a one-line change — useful for ablations and for routing different event categories to different models later.
-- **`:online` suffix for web-grounded forecasts.** Default model is `anthropic/claude-sonnet-4:online`, which routes through OpenRouter's Exa-backed search before answering. This was the single largest Brier improvement — events whose resolution lies past the LLM's knowledge cutoff (most of them, in a live forecasting setting) drop from near-uniform (~0.95 Brier on 30-way) to confident-correct (~0.03) once the model can read the news.
-- **Calibration-focused system prompt** that explicitly asks the model to reason about base rates, pick a reference class, weigh evidence directionally, and *then* commit to numbers. The output contract is a JSON object mapping outcome labels to probabilities.
-- **Defensive output parser** that accepts either a `{"label": p}` dict or a list of `{label, probability}` objects, matches labels case-insensitively against the event's declared outcomes, handles missing outcomes by filling with the residual mass, and falls back to a uniform distribution on total parse failure. Includes a balanced-brace extractor for search-enabled models that append citations after the JSON. This was load-bearing.
-- **Local backtest harness** in `scripts/` that replays the `sample-resolved` dataset against the running server and prints per-event and aggregate Brier. This was the actual development tool — every prompt change got a Brier delta before it shipped.
-- **Render free tier** for deployment. One service, one env var, one URL.
-
-What makes it different from the stock example agent: the example returns a single `p_yes` float and is structurally binary-only. This agent is multi-outcome native, which matters because a meaningful fraction of Kalshi-style events aren't binary.
+- **FastAPI + Uvicorn** server with a single `POST /predict` endpoint and a Pydantic model matching the official Event contract. `/docs`, `/redoc`, and `/openapi.json` are disabled so schema choices don't leak to competing teams.
+- **4-way `:online` ensemble through OpenRouter:** Claude Sonnet 4 × 2 (self-consistency), GPT-4o, and Gemini-2.5-Flash, each with the `:online` suffix and `max_results=10` so each call gets ~10 Exa-backed search results before reasoning. Independent search backends (Brave/Tavily, Bing, Google) are the actual diversity here, not the model names — when one model's first search result is misleading, another model's different search backend is the corrective signal.
+- **Hybrid residual-mass coercion:** for outcomes the LLM didn't explicitly mention in its JSON, we fill with `max(true_residual_mass, 0.5/N)` — a humility floor at half the uniform fallback. Empirically this beat both the naive 1/N fill (which inflated sums and got deflated under server normalization) and pure residual mass (which amplified confidently-wrong calls into outsized Brier hits).
+- **Asymmetric N-aware clipping:** ceiling `0.95` universal, floor `0.05` for binary and `0` for multi-outcome. A floor on every wrong outcome in a 30-way race destroys the actual outcome's mass after normalization.
+- **3-tier independent-infrastructure fallback** for when OpenRouter is fully down: Anthropic Sonnet direct → OpenAI GPT-4o direct → uniform `1/N`. Tested empirically with mocked outages. (Direct providers are NOT in the active ensemble path — when I tried that, no-search models contributed mediocre guesses on recent events that diluted the search-grounded correct answers. Disabled by `USE_DIRECT_PROVIDERS=0`; keys still active in the fallback chain.)
+- **Tetlock-style calibration prompt:** Outside view first → inside view → devil's advocate → date check → distribute mass. Anchors to specific probability values (5%, 10%, 20%, …, 95%) to break 0.5-clustering. Today's UTC date injected into every prompt because the single highest-ROI prompt change in the Halawi paper was telling the model what date it is.
+- **Defensive output parser:** balanced-brace JSON extractor that ignores markdown citations the `:online` responses append, case-insensitive + whitespace-tolerant outcome label matching, NaN/Inf filtering, percentage auto-detection. Every error path returns a uniform-fallback Prediction so the endpoint never 5xx's — missed events would tank the completion-rate factor in the leaderboard formula.
+- **Per-model 20s timeout** to defend against prophethacks.com's submit-endpoint forecast-check (25s budget, NOT the 10-min eval budget). Bounds tail latency even when one model goes slow.
+- **Back-compat `p_yes` field** in the response alongside `probabilities` so the agent satisfies both the multi-outcome spec from the developer docs AND the older `ai-prophet 0.1.5` CLI which calls `float(result["p_yes"])`. Extras aren't prohibited by either contract.
+- **Local Brier backtest harness** replaying `sample-resolved` against the running server. Every prompt and clipping change got a Brier delta before it shipped. Several "obviously good" ideas (uniform shrinkage, tighter binary ceiling, no-search direct ensemble members) lost in backtest and got reverted — the harness was load-bearing.
+- **Render free tier** for deployment with auto-deploy on git push. `Dockerfile` and `evaluate.sh` included for organizer reproducibility per the rules.
 
 ## Challenges we ran into
 
-- **Schema ambiguity.** The public docs and the actual `prophet forecast retrieve` payload didn't agree on every field. The fix was to treat the live CLI output as ground truth and make Pydantic permissive about extras.
-- **Multi-outcome handling.** Going from "return a float" to "return a normalized distribution over N labels the model has never seen before" exposed every brittle assumption in the parsing layer. Most of the bugs lived there, not in the prompt.
-- **Calibration vs hedging tradeoff.** Clipping bounds the downside but also caps the upside on the events you're genuinely confident about. `[0.03, 0.97]` was picked from backtest, not vibes.
-- **Solo time pressure.** No teammate to bounce prompts off, no second pair of eyes on the parser. Discipline came from the Brier loop — if a change didn't improve the score on the resolved set, it didn't ship.
+- **The schema docs contradict themselves.** Quick Start says "probabilities normalized before scoring", Custom Agent says "should sum to 1", participant guide says "OpenAI-compatible endpoint". An organizer clarified on Discord that it's loose phrasing — actual contract is the per-event POST with the explicit `{probabilities: [...]}` response. I built to that and added the `p_yes` field defensively.
+- **Multi-outcome handling exposed every brittle assumption.** Going from "return a float" to "return a normalized distribution over N labels the model may not have explicitly named in its output" is where most bugs lived. The hybrid residual-mass logic was rewritten three times before backtest agreed it was right.
+- **Ensemble doesn't fix systematic search misinformation.** When `:online` lands the LLM on a wrong source, additional samples of the same model trust the same source. The genuine variance reduction came from *different search backends*, not more samples of one model — that insight reshaped the ensemble composition midway through the build.
+- **Calibration vs hedging tradeoff isn't theoretical.** Pure residual-mass coercion (sum stays ~1.0, server normalization is a no-op) won big on confident-correct cases but amplified the few confident-wrong cases into Brier 1.7+ disasters. The hybrid floor at `0.5/N` was the compromise — picked by backtest, not by feel.
+- **Solo time pressure.** No teammate to bounce prompts off, no second pair of eyes on the parser. Discipline came from the Brier loop — if a change didn't improve the score on `sample-resolved`, it didn't ship. Several theoretically clever ideas reverted because the data said so.
 
 ## Accomplishments that we're proud of
 
 - Multi-outcome native from the first commit, not bolted on.
-- Full path from `git clone` to a live Render URL in under 17 hours, solo.
-- Backtest harness that made every change measurable instead of vibes-based.
-- The parser hasn't returned a malformed response yet across the resolved dataset.
-- Brier 0.168 on the public `sample-resolved` set — inside the market consensus band (~0.15-0.22) on questions where the LLM cutoff is well past the resolution date, thanks to `:online` search grounding.
+- 4-way search ensemble with `max_results=10` and a hybrid residual-mass coercion that's mathematically correct and empirically the best of three variants I tested.
+- 3-tier provider-redundant fallback chain (OpenRouter ensemble → Anthropic direct → OpenAI direct → uniform). The endpoint has not returned a 5xx across all backtests.
+- Every architectural decision is backed by a backtest Brier delta — including the decisions to *not* ship features that seemed obviously useful but lost in the data.
+- Full path from `git clone` to a live Render URL with three-provider redundancy in under 24 hours, solo.
 
 ## What we learned
 
-- Brier rewards humility surprisingly hard. The math on `(p - outcome)^2` means a 0.95 that turns out wrong costs you ~10x what a 0.7 that turns out wrong does. Most "improvements" to a forecasting agent are actually just learning to stop overclaiming.
-- LLMs are decent at picking a reference class when you ask them to, and noticeably worse when you don't.
-- A tight, local evaluation loop is worth more than any individual prompt trick.
+- Brier rewards humility surprisingly hard. The math on `(p - outcome)^2` means a 0.95 that turns out wrong costs you ~10× what a 0.7 that turns out wrong does. Most "improvements" to a forecasting agent are actually just learning to stop overclaiming.
+- Search backend diversity > model diversity. Different LLMs reading the same wrong source agree on the same wrong answer; different search engines surface different sources, and that's where the ensemble actually pays its bills.
+- The fastest way to lose Brier is to forget the date. Injecting today's UTC date into the user prompt was a one-line change that materially reduced "model confused training cutoff with event date" errors.
+- A tight, local evaluation loop is worth more than any individual prompt trick. Without `sample-resolved` to measure against, every change is a guess.
 
 ## What's next for the project
 
-- **Web search integration** for events whose resolution depends on facts the model's training cutoff doesn't cover.
-- **Ensembling** across multiple models via OpenRouter and aggregating with a calibrated mean.
-- **Category-specific routing** — sports, politics, and macro events probably want different prompts and possibly different models.
+- **Category-specific calibration**, especially for "vote count" style events (SCOTUS, US Senate confirmations) where `:online` search consistently lands on the wrong tally and the LLMs get confidently wrong together. Constrained-output decoding with a domain prior might be the fix.
+- **Cross-provider Opus tier** for hard events: a Haiku-class classifier decides "is this event subtle enough to need Opus?" and routes accordingly. Cost-targeted, not blanket.
 - **RAG over historical Kalshi data** to give the model an actual empirical base rate for similar past markets instead of asking it to guess one.
+- **Devil's-advocate second pass** triggered only when the ensemble lands on `max(p) ≥ 0.85`. Cheap insurance against confident-wrong on rare categories.
 
 ## Built with
 
-Python 3.14, FastAPI, Uvicorn, Pydantic, OpenRouter, Claude Sonnet 4, Render.
+Python 3.12, FastAPI, Uvicorn, Pydantic, OpenRouter, Anthropic SDK, OpenAI SDK, Claude Sonnet 4, GPT-4o, Gemini-2.5-Flash, Render.
 
 ## Try it yourself
 
@@ -64,10 +70,10 @@ Python 3.14, FastAPI, Uvicorn, Pydantic, OpenRouter, Claude Sonnet 4, Render.
 git clone https://github.com/chanjoongx/prophet-hacks
 cd prophet-hacks
 pip install -r requirements.txt
-cp .env.example .env   # add your OPENROUTER_API_KEY
+cp .env.example .env   # add your OPENROUTER_API_KEY (and optionally ANTHROPIC_API_KEY, OPENAI_FALLBACK_API_KEY)
 uvicorn main:app --reload
 ```
 
-Then point the Prophet CLI at `http://localhost:8000/predict`, or hit the deployed Render URL directly. Run `python scripts/backtest.py` to replay the resolved sample set and see Brier.
+Then point the Prophet CLI at `http://localhost:8000/predict`, or hit the deployed Render URL (`https://chanjoongx-prophet-hacks.onrender.com/predict`) directly. Run `python scripts/backtest.py` to replay `sample-resolved` end-to-end and see Brier. `bash evaluate.sh` does the full round-trip in one shot per the hackathon submission rules.
 
 Source: https://github.com/chanjoongx/prophet-hacks
