@@ -324,6 +324,13 @@ def _uniform_fallback(outcomes: list[str], reason: str) -> Prediction:
     )
 
 
+# Per-model timeout to defend against the prophethacks.com submit-endpoint
+# check (which times out at 25s, NOT 10min). If one ensemble model is slow,
+# we cap its wait and use whichever models finished in time. Eval timeout is
+# still 10min so this is purely a robustness floor.
+PER_MODEL_TIMEOUT_S = float(os.environ.get("PER_MODEL_TIMEOUT_S", "20"))
+
+
 def _call_single_model(model: str, event: Event) -> tuple[list[MarketProbability] | None, str]:
     """One LLM call. Returns (coerced probabilities, rationale) or (None, error)."""
     is_search_model = ":online" in model or ":search" in model
@@ -343,7 +350,9 @@ def _call_single_model(model: str, event: Event) -> tuple[list[MarketProbability
         # models. Search models put citations outside the JSON so we skip it.
         if not is_search_model:
             kwargs["response_format"] = {"type": "json_object"}
-        resp = client.chat.completions.create(**kwargs)
+        # Per-request timeout via OpenAI SDK's with_options. If this single
+        # model is slow, raise APITimeoutError which our except below catches.
+        resp = client.with_options(timeout=PER_MODEL_TIMEOUT_S).chat.completions.create(**kwargs)
         text = resp.choices[0].message.content or ""
         data = _extract_json(text)
         if isinstance(data, list):
