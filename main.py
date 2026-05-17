@@ -60,6 +60,10 @@ class MarketProbability(BaseModel):
 class Prediction(BaseModel):
     probabilities: list[MarketProbability]
     rationale: str = ""
+    # Back-compat with ai-prophet 0.1.5's CLI which calls float(result["p_yes"]).
+    # The newer spec uses `probabilities`; we ship both so we satisfy whichever
+    # contract the eval server is actually on.
+    p_yes: float = Field(ge=0.01, le=0.99, default=0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -282,11 +286,28 @@ def _coerce_probabilities(raw: Any, outcomes: list[str]) -> list[MarketProbabili
     return result
 
 
+def _compute_p_yes(probs: list[MarketProbability]) -> float:
+    """Derive a single binary p_yes for the v0.1.5 CLI back-compat field.
+
+    Prefers a "Yes" outcome if present (case-insensitive), else the first
+    outcome's probability. Clamped to [0.01, 0.99] to satisfy the old
+    schema's Field(ge=0.01, le=0.99) constraint.
+    """
+    if not probs:
+        return 0.5
+    yes_p = next((p.probability for p in probs if p.market.strip().lower() == "yes"), None)
+    if yes_p is None:
+        yes_p = probs[0].probability
+    return max(0.01, min(0.99, float(yes_p)))
+
+
 def _uniform_fallback(outcomes: list[str], reason: str) -> Prediction:
     n = max(len(outcomes), 1)
+    probs = [MarketProbability(market=o, probability=1.0 / n) for o in outcomes]
     return Prediction(
-        probabilities=[MarketProbability(market=o, probability=1.0 / n) for o in outcomes],
+        probabilities=probs,
         rationale=f"Fallback uniform: {reason}",
+        p_yes=_compute_p_yes(probs),
     )
 
 
@@ -329,7 +350,11 @@ def forecast(event: Event) -> Prediction:
             raise ValueError(f"unexpected JSON type {type(data).__name__}")
 
         probs = _coerce_probabilities(raw_probs, event.outcomes)
-        return Prediction(probabilities=probs, rationale=rationale)
+        return Prediction(
+            probabilities=probs,
+            rationale=rationale,
+            p_yes=_compute_p_yes(probs),
+        )
     except Exception as exc:
         logger.warning("LLM call failed for %s: %s", event.market_ticker, exc)
         return _uniform_fallback(event.outcomes, f"llm error: {type(exc).__name__}")

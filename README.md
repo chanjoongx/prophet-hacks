@@ -57,9 +57,13 @@ Response:
 }
 ```
 
-Each `market` matches the exact label from `event.outcomes`. Values clipped to
-`[0.03, 0.97]` to avoid Brier blow-ups on overconfident misses. Probabilities
-do not need to sum to 1 — the eval server normalizes before scoring.
+Each `market` matches the exact label from `event.outcomes`. Probabilities are
+clipped with an asymmetric, N-aware bound: ceiling `0.95` universally; floor
+`0.05` for binary events, `0` for multi-outcome — applying a floor to every
+wrong outcome in a 30-way race destroys mass on the actual outcome after
+server-side normalization. Probabilities do not need to sum to 1; they are
+scored as-is per the official spec. An additional `p_yes` field is returned
+alongside `probabilities` for back-compat with the `ai-prophet 0.1.5` CLI.
 
 ## Configuration
 

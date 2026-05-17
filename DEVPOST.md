@@ -10,7 +10,7 @@ Prediction markets like Kalshi are one of the few places where being a *little* 
 
 The agent exposes a single `POST /predict` endpoint that consumes the official Prophet `Event` schema (the same payload returned by `prophet forecast retrieve`) and responds with a probability distribution over the event's outcomes that sums to 1.0.
 
-It works for both binary markets (Yes/No) and arbitrary multi-outcome markets (e.g., "Who wins the NBA Finals?" with 16 teams) using the same code path. Probabilities are clipped with an asymmetric, N-aware bound — ceiling 0.95 universally, floor 0.05 for binary and 0 for multi-outcome — because applying a floor to every wrong outcome in a 30-way race destroys the mass on the actual outcome after server-side normalization.
+It works for both binary markets (Yes/No) and arbitrary multi-outcome markets (e.g., "Who wins the NBA Finals?" with 16 teams) using the same code path. Probabilities are clipped with an asymmetric, N-aware bound — ceiling 0.95 universally, floor 0.05 for binary and 0 for multi-outcome — because applying a floor to every wrong outcome in a 30-way race destroys the mass on the actual outcome after server-side normalization. The response also includes a back-compat `p_yes` field so the agent satisfies both the multi-outcome spec and the older `ai-prophet 0.1.5` binary CLI contract.
 
 ## How we built it
 
