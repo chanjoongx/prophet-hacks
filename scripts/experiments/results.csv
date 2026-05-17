@@ -1,0 +1,5 @@
+variant,module,overall_brier,n,wall_seconds,Elections:brier,Elections:n,Entertainment:brier,Entertainment:n,Politics:brier,Politics:n,Sports:brier,Sports:n,notes
+baseline_main,main,0.168178,26,,0.005000,3,0.138889,4,0.526050,3,0.138995,16,from backtest_results.json
+variant_a,scripts.experiments.variant_a,,,,,,,,,,,,NOT RUN: sandbox blocked python execution; variant requires 3x LLM calls per event so cannot derive analytically
+variant_b,scripts.experiments.variant_b,0.168562,26,,0.020000,3,0.138889,4,0.531050,3,0.135870,16,"ANALYTICAL post-processor on baseline preds. Re-clip binary to [0.10, 0.90]. 13 binary correct calls go 0.005 -> 0.020 (lose 0.015 each); 1 wrong (Perez/Lalami) goes 1.805 -> 1.620 (save 0.185). Per-event break-even ratio ~12.3 correct per 1 wrong. Sample has 1/14 wrong so essentially flat."
+variant_c,scripts.experiments.variant_c,0.182886,26,,0.027613,3,0.178786,4,0.514747,3,0.150802,16,"ANALYTICAL post-processor on baseline preds. Blend p_new = 0.85*p + 0.15/N. Hurts every high-confidence correct call (most events). Only SCOTUS (1.435->1.307) and Perez/Lalami (1.805->1.558) benefit. Total Brier worse by ~0.015."

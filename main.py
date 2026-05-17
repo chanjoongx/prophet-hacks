@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -233,9 +234,11 @@ def _coerce_probabilities(raw: Any, outcomes: list[str]) -> list[MarketProbabili
     if isinstance(raw, dict):
         for k, v in raw.items():
             try:
-                by_label[str(k)] = float(v)
+                fv = float(v)
             except (TypeError, ValueError):
                 continue
+            if math.isfinite(fv):
+                by_label[str(k)] = fv
     elif isinstance(raw, list):
         for item in raw:
             if not isinstance(item, dict):
@@ -245,9 +248,11 @@ def _coerce_probabilities(raw: Any, outcomes: list[str]) -> list[MarketProbabili
             if label is None or prob is None:
                 continue
             try:
-                by_label[str(label)] = float(prob)
+                fv = float(prob)
             except (TypeError, ValueError):
                 continue
+            if math.isfinite(fv):
+                by_label[str(label)] = fv
 
     # Snap to canonical outcome labels; fall back to uniform for anything missing.
     n = max(len(outcomes), 1)
@@ -256,9 +261,10 @@ def _coerce_probabilities(raw: Any, outcomes: list[str]) -> list[MarketProbabili
     for outcome in outcomes:
         p = by_label.get(outcome)
         if p is None:
-            # case-insensitive fallback
+            # case-insensitive + whitespace-tolerant fallback
+            outcome_key = outcome.strip().lower()
             for label, value in by_label.items():
-                if label.lower() == outcome.lower():
+                if label.strip().lower() == outcome_key:
                     p = value
                     break
         if p is None:
@@ -286,7 +292,7 @@ def forecast(event: Event) -> Prediction:
     # :online and similar search-enabled models often append citations after
     # the JSON, breaking strict json.loads. We use a tolerant extractor.
     is_search_model = ":online" in DEFAULT_MODEL or ":search" in DEFAULT_MODEL
-    max_tokens = 1500 if is_search_model else 600
+    max_tokens = 1500 if is_search_model else 1200
 
     try:
         client = get_client()
@@ -306,13 +312,22 @@ def forecast(event: Event) -> Prediction:
         resp = client.chat.completions.create(**kwargs)
         text = resp.choices[0].message.content or ""
         data = _extract_json(text)
+
+        # Defensive: LLM may return a top-level list/null/scalar; normalize.
+        if isinstance(data, list):
+            raw_probs: Any = data
+            rationale = ""
+        elif isinstance(data, dict):
+            raw_probs = data.get("probabilities")
+            rationale = str(data.get("rationale", ""))[:500]
+        else:
+            raise ValueError(f"unexpected JSON type {type(data).__name__}")
+
+        probs = _coerce_probabilities(raw_probs, event.outcomes)
+        return Prediction(probabilities=probs, rationale=rationale)
     except Exception as exc:
         logger.warning("LLM call failed for %s: %s", event.market_ticker, exc)
         return _uniform_fallback(event.outcomes, f"llm error: {type(exc).__name__}")
-
-    probs = _coerce_probabilities(data.get("probabilities"), event.outcomes)
-    rationale = str(data.get("rationale", ""))[:500]
-    return Prediction(probabilities=probs, rationale=rationale)
 
 
 # ---------------------------------------------------------------------------
