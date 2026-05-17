@@ -14,7 +14,7 @@ events_*.json
 predictions*.json
 resolved_predictions*.json
 actuals*.json
-backtest_results.json
+backtest*results*.json
 production_backtest_results.json
 scripts/experiments/results*.json
 *.log
