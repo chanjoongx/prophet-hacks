@@ -96,11 +96,28 @@ DEFAULT_MODEL = os.environ.get("FORECAST_MODEL", "anthropic/claude-sonnet-4")
 # vs 0.10 (3-way ensemble) on 26-event sample-resolved. Disable with
 # USE_ENSEMBLE=0 to fall back to single-model behavior.
 USE_ENSEMBLE = os.environ.get("USE_ENSEMBLE", "1") == "1"
+
+# 4-way OpenRouter :online ensemble with Sonnet self-consistency (N=2).
+# Two Sonnet calls reduce single-sample variance via independent Exa search
+# rolls; GPT-4o adds Bing-grounded perspective; Gemini adds Google-grounded.
+# All four get web search via :online suffix.
 ENSEMBLE_MODELS = [
     os.environ.get("ENSEMBLE_MODEL_1", "anthropic/claude-sonnet-4:online"),
-    os.environ.get("ENSEMBLE_MODEL_2", "openai/gpt-4o:online"),
-    os.environ.get("ENSEMBLE_MODEL_3", "google/gemini-2.5-flash:online"),
+    os.environ.get("ENSEMBLE_MODEL_2", "anthropic/claude-sonnet-4:online"),
+    os.environ.get("ENSEMBLE_MODEL_3", "openai/gpt-4o:online"),
+    os.environ.get("ENSEMBLE_MODEL_4", "google/gemini-2.5-flash:online"),
 ]
+
+# Active-mode direct-provider supplements. These call Anthropic and OpenAI
+# directly (independent infrastructure from OpenRouter) WITHOUT web search,
+# acting as calibration anchors against search-grounded confidently-wrong
+# calls. Weight 0.4 means each direct sample counts ~40% of a search sample.
+USE_DIRECT_PROVIDERS = os.environ.get("USE_DIRECT_PROVIDERS", "1") == "1"
+DIRECT_PROVIDER_WEIGHT = float(os.environ.get("DIRECT_PROVIDER_WEIGHT", "0.4"))
+
+# OpenRouter :online plugin config — request more search results (default ~3)
+# so the model has broader context to ground its forecasts.
+WEB_MAX_RESULTS = int(os.environ.get("WEB_MAX_RESULTS", "10"))
 
 # Direct Anthropic API fallback for the rare case where all OpenRouter models
 # fail (outage, rate limit, key revoked). Independent infrastructure path.
@@ -413,7 +430,7 @@ PER_MODEL_TIMEOUT_S = float(os.environ.get("PER_MODEL_TIMEOUT_S", "20"))
 
 
 def _call_single_model(model: str, event: Event) -> tuple[list[MarketProbability] | None, str]:
-    """One LLM call. Returns (coerced probabilities, rationale) or (None, error)."""
+    """One OpenRouter LLM call. Returns (coerced probabilities, rationale) or (None, error)."""
     is_search_model = ":online" in model or ":search" in model
     max_tokens = 1500 if is_search_model else 1200
     try:
@@ -431,6 +448,13 @@ def _call_single_model(model: str, event: Event) -> tuple[list[MarketProbability
         # models. Search models put citations outside the JSON so we skip it.
         if not is_search_model:
             kwargs["response_format"] = {"type": "json_object"}
+        else:
+            # Expand the :online web-search context (default ~3 results -> 10).
+            # The OpenAI Python SDK rejects unknown top-level kwargs, so
+            # OpenRouter's `plugins` array must be passed via `extra_body`.
+            kwargs["extra_body"] = {
+                "plugins": [{"id": "web", "max_results": WEB_MAX_RESULTS}]
+            }
         # Per-request timeout via OpenAI SDK's with_options. If this single
         # model is slow, raise APITimeoutError which our except below catches.
         resp = client.with_options(timeout=PER_MODEL_TIMEOUT_S).chat.completions.create(**kwargs)
@@ -450,135 +474,150 @@ def _call_single_model(model: str, event: Event) -> tuple[list[MarketProbability
         return None, f"{type(exc).__name__}: {str(exc)[:120]}"
 
 
+def _call_anthropic_active(event: Event) -> tuple[list[MarketProbability] | None, str]:
+    """Direct Anthropic Sonnet (no web search). Used as active ensemble member."""
+    client = get_anthropic_client()
+    if client is None:
+        return None, "anthropic key not set"
+    try:
+        msg = client.messages.create(
+            model=ANTHROPIC_FALLBACK_MODEL,
+            max_tokens=1200,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": build_user_prompt(event)}],
+            timeout=PER_MODEL_TIMEOUT_S,
+        )
+        text = msg.content[0].text if msg.content else ""
+        data = _extract_json(text)
+        if isinstance(data, list):
+            raw_probs: Any = data
+            rationale = ""
+        elif isinstance(data, dict):
+            raw_probs = data.get("probabilities")
+            rationale = str(data.get("rationale", ""))[:200]
+        else:
+            return None, "unexpected JSON type"
+        probs = _coerce_probabilities(raw_probs, event.outcomes)
+        return probs, rationale
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:120]}"
+
+
+def _call_openai_direct_active(event: Event) -> tuple[list[MarketProbability] | None, str]:
+    """Direct OpenAI gpt-4o (no web search). Used as active ensemble member."""
+    client = get_openai_fallback_client()
+    if client is None:
+        return None, "openai fallback key not set"
+    try:
+        resp = client.with_options(timeout=PER_MODEL_TIMEOUT_S).chat.completions.create(
+            model=OPENAI_FALLBACK_MODEL,
+            max_tokens=1200,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": build_user_prompt(event)},
+            ],
+        )
+        text = resp.choices[0].message.content or ""
+        data = _extract_json(text)
+        if isinstance(data, list):
+            raw_probs: Any = data
+            rationale = ""
+        elif isinstance(data, dict):
+            raw_probs = data.get("probabilities")
+            rationale = str(data.get("rationale", ""))[:200]
+        else:
+            return None, "unexpected JSON type"
+        probs = _coerce_probabilities(raw_probs, event.outcomes)
+        return probs, rationale
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:120]}"
+
+
 def forecast(event: Event) -> Prediction:
+    """Weighted multi-provider ensemble:
+       - 4 OpenRouter :online models at weight 1.0 each (search-grounded)
+       - 1 Anthropic direct + 1 OpenAI direct at weight DIRECT_PROVIDER_WEIGHT
+         (no web search, acts as calibration anchor)
+       - Weighted-mean per outcome across surviving samples
+       - Uniform fallback only if every single call fails
+    """
     if not event.outcomes:
         return _uniform_fallback([], "no outcomes provided")
 
-    models = ENSEMBLE_MODELS if USE_ENSEMBLE else [DEFAULT_MODEL]
+    if not USE_ENSEMBLE:
+        # Legacy single-model path (disabled by default).
+        probs, rat = _call_single_model(DEFAULT_MODEL, event)
+        if probs is None:
+            return _uniform_fallback(event.outcomes, f"single-model failed: {rat}")
+        return Prediction(
+            probabilities=probs,
+            rationale=f"single-model: {rat}"[:500],
+            p_yes=_compute_p_yes(probs),
+        )
 
-    samples: list[list[MarketProbability]] = []
-    rationales: list[str] = []
+    SEARCH_WEIGHT = 1.0
+    DW = DIRECT_PROVIDER_WEIGHT
+
+    # Build job list: (name, callable, weight, kind)
+    jobs: list[tuple[str, Any, float, str]] = []
+    for m in ENSEMBLE_MODELS:
+        jobs.append((m, lambda mm=m: _call_single_model(mm, event), SEARCH_WEIGHT, "search"))
+
+    if USE_DIRECT_PROVIDERS:
+        if get_anthropic_client() is not None:
+            jobs.append(("anthropic-direct", lambda: _call_anthropic_active(event), DW, "direct"))
+        if get_openai_fallback_client() is not None:
+            jobs.append(("openai-direct", lambda: _call_openai_direct_active(event), DW, "direct"))
+
+    samples_weighted: list[tuple[list[MarketProbability], float, str, str]] = []
     failures: list[str] = []
 
-    if len(models) == 1:
-        # Single-model path — synchronous to keep things simple
-        probs, rat_or_err = _call_single_model(models[0], event)
-        if probs is not None:
-            samples.append(probs)
-            rationales.append(rat_or_err)
-        else:
-            failures.append(f"{models[0]}: {rat_or_err}")
-    else:
-        # Parallel fan-out; wall time ~= slowest model, not sum
-        with ThreadPoolExecutor(max_workers=len(models)) as ex:
-            future_to_model = {ex.submit(_call_single_model, m, event): m for m in models}
-            for fut in as_completed(future_to_model):
-                model = future_to_model[fut]
-                try:
-                    probs, rat_or_err = fut.result()
-                except Exception as exc:
-                    failures.append(f"{model}: {type(exc).__name__}")
-                    continue
-                if probs is not None:
-                    samples.append(probs)
-                    rationales.append(rat_or_err)
-                else:
-                    failures.append(f"{model}: {rat_or_err}")
-
-    if not samples:
-        # All OpenRouter ensemble models failed. Walk a 2-tier independent-
-        # infrastructure fallback chain: Anthropic direct, then OpenAI direct.
-        # Either is better than uniform for events the model has knowledge of.
-        logger.warning("All OpenRouter models failed for %s; trying Anthropic direct. %s",
-                       event.market_ticker, failures[:3])
-        a_client = get_anthropic_client()
-        if a_client is not None:
+    with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as ex:
+        future_to_meta = {ex.submit(fn): (name, weight, kind) for name, fn, weight, kind in jobs}
+        for fut in as_completed(future_to_meta):
+            name, weight, kind = future_to_meta[fut]
             try:
-                msg = a_client.messages.create(
-                    model=ANTHROPIC_FALLBACK_MODEL,
-                    max_tokens=1200,
-                    system=SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": build_user_prompt(event)}],
-                    timeout=PER_MODEL_TIMEOUT_S,
-                )
-                text = msg.content[0].text if msg.content else ""
-                data = _extract_json(text)
-                if isinstance(data, list):
-                    raw_probs_fb: Any = data
-                    rat_fb = ""
-                elif isinstance(data, dict):
-                    raw_probs_fb = data.get("probabilities")
-                    rat_fb = str(data.get("rationale", ""))[:200]
-                else:
-                    raw_probs_fb = None
-                    rat_fb = ""
-                if raw_probs_fb is not None:
-                    probs_fb = _coerce_probabilities(raw_probs_fb, event.outcomes)
-                    return Prediction(
-                        probabilities=probs_fb,
-                        rationale=(f"Anthropic-direct fallback (OpenRouter failed): {rat_fb}")[:500],
-                        p_yes=_compute_p_yes(probs_fb),
-                    )
+                probs, rat_or_err = fut.result()
             except Exception as exc:
-                logger.warning("Anthropic fallback also failed for %s: %s", event.market_ticker, exc)
+                failures.append(f"{name}: {type(exc).__name__}")
+                continue
+            if probs is not None:
+                samples_weighted.append((probs, weight, kind, rat_or_err))
+            else:
+                failures.append(f"{name}: {rat_or_err}")
 
-        # Anthropic also failed (or not configured). Try direct OpenAI.
-        logger.warning("Anthropic fallback unavailable for %s; trying OpenAI direct.", event.market_ticker)
-        o_client = get_openai_fallback_client()
-        if o_client is not None:
-            try:
-                resp = o_client.with_options(timeout=PER_MODEL_TIMEOUT_S).chat.completions.create(
-                    model=OPENAI_FALLBACK_MODEL,
-                    max_tokens=1200,
-                    temperature=0.2,
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": build_user_prompt(event)},
-                    ],
-                )
-                text = resp.choices[0].message.content or ""
-                data = _extract_json(text)
-                if isinstance(data, list):
-                    raw_probs_oai: Any = data
-                    rat_oai = ""
-                elif isinstance(data, dict):
-                    raw_probs_oai = data.get("probabilities")
-                    rat_oai = str(data.get("rationale", ""))[:200]
-                else:
-                    raw_probs_oai = None
-                    rat_oai = ""
-                if raw_probs_oai is not None:
-                    probs_oai = _coerce_probabilities(raw_probs_oai, event.outcomes)
-                    return Prediction(
-                        probabilities=probs_oai,
-                        rationale=(f"OpenAI-direct fallback (OpenRouter+Anthropic failed): {rat_oai}")[:500],
-                        p_yes=_compute_p_yes(probs_oai),
-                    )
-            except Exception as exc:
-                logger.warning("OpenAI fallback also failed for %s: %s", event.market_ticker, exc)
+    if not samples_weighted:
+        logger.warning("All providers failed for %s: %s", event.market_ticker, failures[:5])
+        return _uniform_fallback(event.outcomes, f"all providers failed: {failures[:3]}")
 
-        return _uniform_fallback(event.outcomes, f"all fallbacks failed: {failures[:3]}")
-
-    # Mean per outcome across surviving samples
+    # Weighted mean per outcome
     n = max(len(event.outcomes), 1)
     floor = floor_for(n)
+    total_weight = sum(w for _, w, _, _ in samples_weighted)
     averaged: list[MarketProbability] = []
     for i, outcome in enumerate(event.outcomes):
-        vals = [s[i].probability for s in samples if i < len(s)]
-        if not vals:
-            avg = 1.0 / n
-        else:
-            avg = sum(vals) / len(vals)
+        weighted_sum = 0.0
+        for probs, weight, _, _ in samples_weighted:
+            if i < len(probs):
+                weighted_sum += probs[i].probability * weight
+        avg = weighted_sum / total_weight if total_weight > 0 else 1.0 / n
         if not math.isfinite(avg):
             avg = 1.0 / n
         avg = max(floor, min(CLIP_MAX, avg))
         averaged.append(MarketProbability(market=outcome, probability=avg))
 
+    n_search = sum(1 for _, _, k, _ in samples_weighted if k == "search")
+    n_direct = sum(1 for _, _, k, _ in samples_weighted if k == "direct")
+    sample_rat = next((r for _, _, _, r in samples_weighted if r), "")[:200]
+
     rationale = (
-        f"ensemble mean ({len(samples)}/{len(models)} models); "
-        + (rationales[0] if rationales else "")
+        f"weighted ensemble: {n_search}/{len(ENSEMBLE_MODELS)} search "
+        f"+ {n_direct} direct (search@{SEARCH_WEIGHT}, direct@{DW}); "
+        + sample_rat
     )[:500]
+
     return Prediction(
         probabilities=averaged,
         rationale=rationale,
