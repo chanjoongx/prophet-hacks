@@ -27,6 +27,12 @@ from fastapi import FastAPI
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+try:
+    import anthropic  # type: ignore
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
+
 load_dotenv()
 
 logger = logging.getLogger("agent")
@@ -95,6 +101,30 @@ ENSEMBLE_MODELS = [
     os.environ.get("ENSEMBLE_MODEL_2", "openai/gpt-4o:online"),
     os.environ.get("ENSEMBLE_MODEL_3", "google/gemini-2.5-flash:online"),
 ]
+
+# Direct Anthropic API fallback for the rare case where all OpenRouter models
+# fail (outage, rate limit, key revoked). Independent infrastructure path.
+# No web search (Anthropic Messages API has no :online equivalent), so this
+# is the "model knowledge only" fallback. Set ANTHROPIC_API_KEY on Render
+# to enable; otherwise we drop to uniform on full OpenRouter failure.
+ANTHROPIC_FALLBACK_MODEL = os.environ.get(
+    "ANTHROPIC_FALLBACK_MODEL", "claude-sonnet-4-20250514"
+)
+
+_anthropic_client: Any | None = None
+
+
+def get_anthropic_client() -> Any | None:
+    global _anthropic_client
+    if _anthropic_client is not None:
+        return _anthropic_client
+    if not _ANTHROPIC_AVAILABLE:
+        return None
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    _anthropic_client = anthropic.Anthropic(api_key=api_key)
+    return _anthropic_client
 
 _client: OpenAI | None = None
 
@@ -276,24 +306,43 @@ def _coerce_probabilities(raw: Any, outcomes: list[str]) -> list[MarketProbabili
             if math.isfinite(fv):
                 by_label[str(label)] = fv
 
-    # Snap to canonical outcome labels; fall back to uniform for anything missing.
+    # Match outcomes to LLM-provided probs first (exact, then case-insensitive
+    # + whitespace-tolerant). Track unmatched separately so we can distribute
+    # RESIDUAL MASS over them instead of 1/N uniform.
+    #
+    # Why residual mass: the eval server normalizes probs before scoring (per
+    # Quick Start docs). If we fill 29 missing outcomes with 1/30 each on top
+    # of a confident LLM answer (Schaefer 0.95), total sums to ~1.9 and
+    # server normalization deflates Schaefer to ~0.50, ballooning Brier from
+    # 0.03 to 0.26 on the actual winner. Residual mass keeps the sum ~= 1
+    # so server normalization is a no-op.
     n = max(len(outcomes), 1)
     floor = floor_for(n)
-    result: list[MarketProbability] = []
+
+    matched: dict[str, float] = {}
+    unmatched_outcomes: list[str] = []
     for outcome in outcomes:
         p = by_label.get(outcome)
         if p is None:
-            # case-insensitive + whitespace-tolerant fallback
             outcome_key = outcome.strip().lower()
             for label, value in by_label.items():
                 if label.strip().lower() == outcome_key:
                     p = value
                     break
-        if p is None:
-            p = 1.0 / n  # uniform fallback for missing outcome
-        # If LLM accidentally returned percent
-        if p > 1.0:
-            p = p / 100.0
+        if p is not None:
+            if p > 1.0:
+                p = p / 100.0  # LLM accidentally returned percent
+            matched[outcome] = p
+        else:
+            unmatched_outcomes.append(outcome)
+
+    total_matched = sum(matched.values())
+    n_unmatched = len(unmatched_outcomes)
+    residual_each = (max(0.0, 1.0 - total_matched) / n_unmatched) if n_unmatched > 0 else 0.0
+
+    result: list[MarketProbability] = []
+    for outcome in outcomes:
+        p = matched.get(outcome, residual_each)
         p = max(floor, min(CLIP_MAX, p))
         result.append(MarketProbability(market=outcome, probability=p))
     return result
@@ -405,8 +454,42 @@ def forecast(event: Event) -> Prediction:
                     failures.append(f"{model}: {rat_or_err}")
 
     if not samples:
-        logger.warning("All models failed for %s: %s", event.market_ticker, failures)
-        return _uniform_fallback(event.outcomes, f"all models failed: {failures[:3]}")
+        # All OpenRouter ensemble models failed. Try direct Anthropic as a
+        # last-resort independent-infrastructure fallback. No web search but
+        # still LLM reasoning > uniform 1/N for events the model knows.
+        logger.warning("All OpenRouter models failed for %s; trying Anthropic direct. %s",
+                       event.market_ticker, failures[:3])
+        client = get_anthropic_client()
+        if client is not None:
+            try:
+                msg = client.messages.create(
+                    model=ANTHROPIC_FALLBACK_MODEL,
+                    max_tokens=1200,
+                    system=SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": build_user_prompt(event)}],
+                    timeout=PER_MODEL_TIMEOUT_S,
+                )
+                text = msg.content[0].text if msg.content else ""
+                data = _extract_json(text)
+                if isinstance(data, list):
+                    raw_probs_fb: Any = data
+                    rat_fb = ""
+                elif isinstance(data, dict):
+                    raw_probs_fb = data.get("probabilities")
+                    rat_fb = str(data.get("rationale", ""))[:200]
+                else:
+                    raw_probs_fb = None
+                    rat_fb = ""
+                if raw_probs_fb is not None:
+                    probs_fb = _coerce_probabilities(raw_probs_fb, event.outcomes)
+                    return Prediction(
+                        probabilities=probs_fb,
+                        rationale=(f"Anthropic-direct fallback (OpenRouter failed): {rat_fb}")[:500],
+                        p_yes=_compute_p_yes(probs_fb),
+                    )
+            except Exception as exc:
+                logger.warning("Anthropic fallback also failed for %s: %s", event.market_ticker, exc)
+        return _uniform_fallback(event.outcomes, f"all models + anthropic failed: {failures[:3]}")
 
     # Mean per outcome across surviving samples
     n = max(len(event.outcomes), 1)

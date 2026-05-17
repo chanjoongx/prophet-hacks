@@ -11,6 +11,8 @@ services:
     envVars:
       - key: OPENROUTER_API_KEY
         sync: false       # set manually in Render dashboard
+      - key: ANTHROPIC_API_KEY
+        sync: false       # optional: direct Anthropic fallback if OpenRouter fails
       - key: FORECAST_MODEL
         value: anthropic/claude-sonnet-4:online
       - key: PYTHON_VERSION
