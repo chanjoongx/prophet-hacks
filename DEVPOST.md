@@ -14,7 +14,7 @@ On the public `sample-resolved` dataset, the agent's production Brier ranges rou
 
 The architecture is intentionally boring in structure and aggressive in inference. Most of the code is parsing and fallback paths; the interesting decisions are the ensemble shape and the calibration prompt.
 
-**Tier 1 — OpenRouter `:online` ensemble (parallel, equal weight):** Claude Sonnet 4 × 2 (self-consistency), GPT-4o, and Gemini 2.5 Flash, each with the `:online` suffix and `max_results=10` so every call gets ~10 Exa-backed web results before reasoning. Independent search backends (Brave/Tavily, Bing, Google) are the real diversity here — when one model's first hit is misleading, the other models' different search engines provide the corrective signal.
+**Tier 1 — OpenRouter `:online` ensemble (parallel, equal weight):** Claude Sonnet 4 × 2 (self-consistency), GPT-4o, and Gemini 2.5 Flash, each with the `:online` suffix and `max_results=10` so every call gets ~10 web-search results before reasoning. Even when models query the same retrieval layer, they weight and interpret the same returned snippets differently — duplicating Sonnet exploits Exa's per-call ranking variance, and adding GPT-4o and Gemini brings different reasoning biases. When one call latches onto a misleading source, peers often look past it.
 
 **Tier 2/3 — independent-infrastructure fallback chain:** if every OpenRouter call fails, the agent walks Anthropic Sonnet direct → OpenAI GPT-4o direct → uniform `1/N`. Tested with mocked outages. (Active-mode direct providers were measured in backtest and disabled: no-search models don't know recent events and dilute the search-grounded correct answers more than they anchor wrong ones.)
 
