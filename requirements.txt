@@ -1,0 +1,7 @@
+ai-prophet>=0.1.5
+ai-prophet-core>=0.1.5
+fastapi>=0.110
+uvicorn[standard]>=0.27
+openai>=1.40
+python-dotenv>=1.0
+httpx>=0.27
