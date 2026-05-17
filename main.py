@@ -126,6 +126,28 @@ def get_anthropic_client() -> Any | None:
     _anthropic_client = anthropic.Anthropic(api_key=api_key)
     return _anthropic_client
 
+
+# Third-tier fallback: direct OpenAI API. Triggered ONLY if both OpenRouter
+# ensemble AND Anthropic direct have failed (very rare). Provider diversity
+# vs Anthropic (independent infrastructure, different model family). No web
+# search via basic Chat Completions API. Distinct env var
+# OPENAI_FALLBACK_API_KEY so it does not collide with the OPENAI_API_KEY
+# slot used by get_client() as an OpenRouter alias.
+OPENAI_FALLBACK_MODEL = os.environ.get("OPENAI_FALLBACK_MODEL", "gpt-4o")
+
+_openai_fallback_client: OpenAI | None = None
+
+
+def get_openai_fallback_client() -> OpenAI | None:
+    global _openai_fallback_client
+    if _openai_fallback_client is not None:
+        return _openai_fallback_client
+    api_key = os.environ.get("OPENAI_FALLBACK_API_KEY")
+    if not api_key:
+        return None
+    _openai_fallback_client = OpenAI(api_key=api_key)  # default base_url = api.openai.com
+    return _openai_fallback_client
+
 _client: OpenAI | None = None
 
 
@@ -464,15 +486,15 @@ def forecast(event: Event) -> Prediction:
                     failures.append(f"{model}: {rat_or_err}")
 
     if not samples:
-        # All OpenRouter ensemble models failed. Try direct Anthropic as a
-        # last-resort independent-infrastructure fallback. No web search but
-        # still LLM reasoning > uniform 1/N for events the model knows.
+        # All OpenRouter ensemble models failed. Walk a 2-tier independent-
+        # infrastructure fallback chain: Anthropic direct, then OpenAI direct.
+        # Either is better than uniform for events the model has knowledge of.
         logger.warning("All OpenRouter models failed for %s; trying Anthropic direct. %s",
                        event.market_ticker, failures[:3])
-        client = get_anthropic_client()
-        if client is not None:
+        a_client = get_anthropic_client()
+        if a_client is not None:
             try:
-                msg = client.messages.create(
+                msg = a_client.messages.create(
                     model=ANTHROPIC_FALLBACK_MODEL,
                     max_tokens=1200,
                     system=SYSTEM_PROMPT,
@@ -499,7 +521,44 @@ def forecast(event: Event) -> Prediction:
                     )
             except Exception as exc:
                 logger.warning("Anthropic fallback also failed for %s: %s", event.market_ticker, exc)
-        return _uniform_fallback(event.outcomes, f"all models + anthropic failed: {failures[:3]}")
+
+        # Anthropic also failed (or not configured). Try direct OpenAI.
+        logger.warning("Anthropic fallback unavailable for %s; trying OpenAI direct.", event.market_ticker)
+        o_client = get_openai_fallback_client()
+        if o_client is not None:
+            try:
+                resp = o_client.with_options(timeout=PER_MODEL_TIMEOUT_S).chat.completions.create(
+                    model=OPENAI_FALLBACK_MODEL,
+                    max_tokens=1200,
+                    temperature=0.2,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": build_user_prompt(event)},
+                    ],
+                )
+                text = resp.choices[0].message.content or ""
+                data = _extract_json(text)
+                if isinstance(data, list):
+                    raw_probs_oai: Any = data
+                    rat_oai = ""
+                elif isinstance(data, dict):
+                    raw_probs_oai = data.get("probabilities")
+                    rat_oai = str(data.get("rationale", ""))[:200]
+                else:
+                    raw_probs_oai = None
+                    rat_oai = ""
+                if raw_probs_oai is not None:
+                    probs_oai = _coerce_probabilities(raw_probs_oai, event.outcomes)
+                    return Prediction(
+                        probabilities=probs_oai,
+                        rationale=(f"OpenAI-direct fallback (OpenRouter+Anthropic failed): {rat_oai}")[:500],
+                        p_yes=_compute_p_yes(probs_oai),
+                    )
+            except Exception as exc:
+                logger.warning("OpenAI fallback also failed for %s: %s", event.market_ticker, exc)
+
+        return _uniform_fallback(event.outcomes, f"all fallbacks failed: {failures[:3]}")
 
     # Mean per outcome across surviving samples
     n = max(len(event.outcomes), 1)

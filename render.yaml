@@ -10,9 +10,11 @@ services:
     healthCheckPath: /health
     envVars:
       - key: OPENROUTER_API_KEY
-        sync: false       # set manually in Render dashboard
+        sync: false       # primary key — set in Render dashboard
       - key: ANTHROPIC_API_KEY
-        sync: false       # optional: direct Anthropic fallback if OpenRouter fails
+        sync: false       # tier-2 fallback (direct Anthropic, no web search)
+      - key: OPENAI_FALLBACK_API_KEY
+        sync: false       # tier-3 fallback (direct OpenAI, no web search)
       - key: FORECAST_MODEL
         value: anthropic/claude-sonnet-4:online
       - key: PYTHON_VERSION
