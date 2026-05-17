@@ -27,3 +27,6 @@ scripts/experiments/results*.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Personal handover doc for future Claude Code sessions; never commit
+CLAUDE.md
